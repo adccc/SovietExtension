@@ -45,6 +45,11 @@ static void YMDyldImageAdded(const struct mach_header *mh, intptr_t vmaddr_slide
 static void YMRegisterDyldCallbackIfNeeded(void);
 static void YMInstallMultiOpenPatch(void);
 
+typedef enum {
+    YMRevokeHookModePointer = 0,   // 4.1.9：写 off_91EAD20
+    YMRevokeHookModeInline  = 1,   // 4.1.10：直接 patch 函数入口
+} YMRevokeHookMode;
+
 #pragma mark - MessageWrap 字段布局
 
 /*
@@ -98,6 +103,8 @@ typedef struct {
     uintptr_t YMMultiOpenTryPreventMultiInstanceVA;
 
     YMMessageWrapLayout layout;
+    
+    YMRevokeHookMode hookMode;//4.1.10添加
 } YMWeChatAdaptProfile;
 
 static const YMWeChatAdaptProfile YMAdaptProfiles[] = {
@@ -114,6 +121,7 @@ static const YMWeChatAdaptProfile YMAdaptProfiles[] = {
         //   LDR  X9, [X9,#off_91EAD20@PAGEOFF]
         //   CBZ  X9, loc_27A03B0
         //   BR   X9
+        .hookMode = YMRevokeHookModePointer,
         .hookPointerVA = 0x91EAD20, // ym_HandleSysMsg_RevokeMsg->
 
         // ym_HandleSysMsg_RevokeMsg 原函数里用来构造撤回 MessageWrap 的模板：unk_7861730
@@ -127,6 +135,47 @@ static const YMWeChatAdaptProfile YMAdaptProfiles[] = {
         // sub_3822FA4：内部会构造 type=10000 + paymsg XML，然后调用 ym_AddLocalMessageWrap。
         .insertPaySysMsgToSessionVA = 0x3822FA4, // [CDATA]->
         .YMMultiOpenTryPreventMultiInstanceVA = 0x1C0A64,
+
+        .layout = {
+            .messageWrapSize = 616,
+
+            .remoteUserOrSessionOffset = 24,
+            .selfUserOffset = 48,
+
+            .createTimeMsOffset = 256,
+            .createTimeSecOffset = 276,
+
+            .contentOffset = 328,
+        },
+    },
+    
+    {
+        .displayName = "Mac WeChat 4.1.10.53 arm64 / 268853",
+
+        .bundleID = "com.tencent.xinWeChat",
+        .shortVersion = "4.1.10",
+        .buildVersion = "268853",
+
+        // ym_HandleSysMsg_RevokeMsg 开头的热补丁函数指针。
+        // 汇编：
+        //   ADRP X9, #off_91EAD20@PAGE
+        //   LDR  X9, [X9,#off_91EAD20@PAGEOFF]
+        //   CBZ  X9, loc_27A03B0
+        //   BR   X9
+        .hookMode = YMRevokeHookModeInline,
+        .hookPointerVA = 0x2846E84, // ym_HandleSysMsg_RevokeMsg->
+
+        // ym_HandleSysMsg_RevokeMsg 原函数里用来构造撤回 MessageWrap 的模板：unk_7861730
+        .rawMessageTemplateVA = 0x7A7AD88, // ym_HandleSysMsg_RevokeMsg->
+
+        // MessageWrap 相关函数
+        .messageWrapFromRawVA = 0x482F54C, // ym_HandleSysMsg_RevokeMsg->
+        .messageWrapDestructVA = 0x2123AC0, // ym_HandleSysMsg_RevokeMsg->
+
+        // 现成的本地系统消息插入函数。
+        // sub_3822FA4：内部会构造 type=10000 + paymsg XML，然后调用 ym_AddLocalMessageWrap。
+        .insertPaySysMsgToSessionVA = 0x38EBBFC, // [CDATA]->
+        .YMMultiOpenTryPreventMultiInstanceVA = 0x1C4EA8,
 
         .layout = {
             .messageWrapSize = 616,
@@ -697,6 +746,93 @@ static BOOL YMPatchARM64ReturnYES(uintptr_t address, const char *name) {
     return ok;
 }
 
+/*
+ 4.1.10
+ ARM64 函数入口绝对跳转：
+
+   ldr x16, #8
+   br  x16
+   .quad hookAddress
+
+ 机器码：
+   50 00 00 58
+   00 02 1F D6
+   hookAddress 8 bytes
+
+ 说明：
+   1. x16 是临时寄存器，按 ABI 可以用。
+   2. 不改 x0/x1，所以 YMHandleSysMsgRevokeMsgHook(a1, a2) 能正常收到参数。
+   3. 原函数是被 BL 调用的，LR 已经是上层返回地址。
+      用 BR 跳到 hook，hook 最后 ret，会直接回到原调用者。
+   4. 这里不需要 trampoline，因为就是要阻止原撤回逻辑继续执行。
+ */
+static BOOL YMPatchARM64AbsoluteJump(uintptr_t address,
+                                     uintptr_t targetAddress,
+                                     const char *name) {
+    if (address == 0 || targetAddress == 0) {
+        YMLog(@"%s inline hook failed: address or target is zero", name);
+        return NO;
+    }
+
+    void *target = (void *)address;
+
+    uint8_t patch[16] = {0};
+
+    uint32_t insnLdrX16 = 0x58000050; // ldr x16, #8
+    uint32_t insnBrX16  = 0xD61F0200; // br x16
+
+    memcpy(patch + 0, &insnLdrX16, sizeof(insnLdrX16));
+    memcpy(patch + 4, &insnBrX16, sizeof(insnBrX16));
+    memcpy(patch + 8, &targetAddress, sizeof(targetAddress));
+
+    YMPrintCodeBytes(name, "before", target);
+
+    uint8_t current[16] = {0};
+    memcpy(current, target, sizeof(current));
+
+    if (memcmp(current, patch, sizeof(patch)) == 0) {
+        YMLog(@"%s already inline hooked, address=0x%lx",
+              name,
+              (unsigned long)address);
+        return YES;
+    }
+
+    if (!YMProtectCodePage(address,
+                           sizeof(patch),
+                           VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY,
+                           name,
+                           "RW|COPY")) {
+        return NO;
+    }
+
+    memcpy(target, patch, sizeof(patch));
+
+    sys_icache_invalidate(target, sizeof(patch));
+
+    if (!YMProtectCodePage(address,
+                           sizeof(patch),
+                           VM_PROT_READ | VM_PROT_EXECUTE,
+                           name,
+                           "RX")) {
+        return NO;
+    }
+
+    uint8_t check[16] = {0};
+    memcpy(check, target, sizeof(check));
+
+    BOOL ok = memcmp(check, patch, sizeof(patch)) == 0;
+
+    YMPrintCodeBytes(name, "after", target);
+
+    YMLog(@"%s inline hook result=%@, address=0x%lx, target=0x%lx",
+          name,
+          ok ? @"OK" : @"FAIL",
+          (unsigned long)address,
+          (unsigned long)targetAddress);
+
+    return ok;
+}
+
 #pragma mark - 本地插入灰色系统消息
 
 /*
@@ -907,10 +1043,34 @@ static BOOL YMPatchAntiRevokeWithSlide(intptr_t slide, NSString *source) {
        2. 可以在 hook 里自己插入提示消息
        3. 不需要改 __TEXT 指令
     */
-    BOOL ok = YMWritePointer(pointerAddress,
-                             hookAddress,
-                             0,
-                             "revoke hook pointer -> YMHandleSysMsgRevokeMsgHook");
+//    BOOL ok = YMWritePointer(pointerAddress,
+//                             hookAddress,
+//                             0,
+//                             "revoke hook pointer -> YMHandleSysMsgRevokeMsgHook");
+    
+    BOOL ok = NO;
+
+    if (profile->hookMode == YMRevokeHookModePointer) {
+        /*
+         4.1.9：
+         写微信自己预留的 off_91EAD20 函数指针。
+         */
+        ok = YMWritePointer(pointerAddress,
+                            hookAddress,
+                            0,
+                            "revoke hook pointer -> YMHandleSysMsgRevokeMsgHook");
+    } else if (profile->hookMode == YMRevokeHookModeInline) {
+        /*
+         4.1.10：
+         没有 off_xxx 热补丁指针，只能直接 patch 函数入口。
+         */
+        ok = YMPatchARM64AbsoluteJump(pointerAddress,
+                                      hookAddress,
+                                      "revoke inline hook -> YMHandleSysMsgRevokeMsgHook");
+    } else {
+        YMLog(@"unknown revoke hook mode: %d", profile->hookMode);
+        ok = NO;
+    }
 
     if (ok) {
         YMHasPatchedAntiRevoke = YES;
